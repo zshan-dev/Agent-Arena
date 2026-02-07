@@ -1,6 +1,7 @@
 import cors from "@elysiajs/cors";
 import { Elysia } from "elysia";
-import { CLIENT_URL } from "../constants/env.constants";
+import { CLIENT_URL, NODE_ENV } from "../constants/env.constants";
+import openapi from "@elysiajs/openapi";
 
 const app = new Elysia()
 	.use(
@@ -9,6 +10,7 @@ const app = new Elysia()
 			methods: ["POST", "PATCH", "GET", "DELETE"],
 		}),
 	)
+	.use(openapi({ enabled: NODE_ENV === "development" }))
 	.get("/", () => "Hello Elysia")
 	.listen(3000);
 
