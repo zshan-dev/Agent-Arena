@@ -79,14 +79,15 @@ class DiscordClient {
       intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildVoiceStates,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent,
       ],
     });
 
     this.registerEventHandlers();
 
-    await this.client.login(DISCORD_BOT_TOKEN);
-    // Wait for the ready event
-    await new Promise<void>((resolve, reject) => {
+    // Set up the ready-wait promise BEFORE login to avoid race condition
+    const readyPromise = new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(() => {
         reject(new Error("Discord client did not become ready within 30 seconds."));
       }, 30_000);
@@ -95,13 +96,10 @@ class DiscordClient {
         clearTimeout(timeout);
         resolve();
       });
-
-      // If already ready (race condition), resolve immediately
-      if (this.client!.isReady()) {
-        clearTimeout(timeout);
-        resolve();
-      }
     });
+
+    await this.client.login(DISCORD_BOT_TOKEN);
+    await readyPromise;
   }
 
   /**
