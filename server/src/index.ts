@@ -2,9 +2,7 @@ import cors from "@elysiajs/cors";
 import { Elysia } from "elysia";
 import { CLIENT_URL, NODE_ENV } from "../constants/env.constants";
 import openapi from "@elysiajs/openapi";
-<<<<<<< HEAD
 import { llmController } from "./modules/llm";
-=======
 import { minecraftController } from "./modules/minecraft";
 import { minecraftWs } from "./modules/minecraft/ws";
 import { registerAllActions } from "./modules/minecraft/bot/actions/register";
@@ -13,7 +11,6 @@ import { startStateObserver } from "./modules/minecraft/bot/state/state-observer
 // Initialize action handlers and state observer before starting the server
 registerAllActions();
 startStateObserver();
->>>>>>> master
 
 const app = new Elysia()
 	.use(
@@ -24,12 +21,9 @@ const app = new Elysia()
 	)
 	.use(openapi({ enabled: NODE_ENV === "development" }))
 	.get("/", () => "Hello Elysia")
-<<<<<<< HEAD
 	.use(llmController)
-=======
 	.use(minecraftController)
 	.use(minecraftWs)
->>>>>>> master
 	.listen(3000);
 
 console.log(
