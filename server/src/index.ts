@@ -2,6 +2,7 @@ import cors from "@elysiajs/cors";
 import { Elysia } from "elysia";
 import { CLIENT_URL, NODE_ENV } from "../constants/env.constants";
 import openapi from "@elysiajs/openapi";
+import { llmController } from "./modules/llm";
 
 const app = new Elysia()
 	.use(
@@ -12,6 +13,7 @@ const app = new Elysia()
 	)
 	.use(openapi({ enabled: NODE_ENV === "development" }))
 	.get("/", () => "Hello Elysia")
+	.use(llmController)
 	.listen(3000);
 
 console.log(
