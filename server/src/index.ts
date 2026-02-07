@@ -2,6 +2,7 @@ import cors from "@elysiajs/cors";
 import { Elysia } from "elysia";
 import { CLIENT_URL, NODE_ENV } from "../constants/env.constants";
 import openapi from "@elysiajs/openapi";
+import { llmController } from "./modules/llm";
 import { minecraftController } from "./modules/minecraft";
 import { minecraftWs } from "./modules/minecraft/ws";
 import { registerAllActions } from "./modules/minecraft/bot/actions/register";
@@ -24,6 +25,7 @@ const app = new Elysia()
 	)
 	.use(openapi({ enabled: NODE_ENV === "development" }))
 	.get("/", () => "Hello Elysia")
+	.use(llmController)
 	.use(minecraftController)
 	.use(minecraftWs)
 	.use(discordController)
