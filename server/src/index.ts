@@ -14,6 +14,14 @@ import { discordClient } from "./modules/discord/client/discord-client";
 import { DISCORD_AUTO_START } from "../constants/discord.constants";
 import { testingController } from "./modules/testing";
 import { testingWs } from "./modules/testing/ws";
+import { evaluationController } from "./modules/evaluation";
+
+// Import all metrics to ensure they register themselves
+import "./modules/evaluation/metrics/cooperation.metric";
+import "./modules/evaluation/metrics/task-completion.metric";
+import "./modules/evaluation/metrics/response-latency.metric";
+import "./modules/evaluation/metrics/resource-sharing.metric";
+import "./modules/evaluation/metrics/communication-quality.metric";
 
 // Initialize action handlers and state observer before starting the server
 registerAllActions();
@@ -36,6 +44,7 @@ const app = new Elysia()
 	.use(discordWs)
 	.use(testingController)
 	.use(testingWs)
+	.use(evaluationController)
 	.listen(3000);
 
 console.log(
@@ -44,8 +53,10 @@ console.log(
 
 console.log("[Testing Agent System] Initialized with 6 behavioral profiles");
 console.log("[Testing Agent System] API endpoints available at /api/agents");
-console.log("[Test Orchestration] API endpoints available at /api/tests");
-console.log("[Test Orchestration] WebSocket available at /ws/tests");
+console.log("[Test Orchestration] API endpoints available at /api/testing");
+console.log("[Test Orchestration] WebSocket available at /ws/testing");
+console.log("[Evaluation System] Initialized with 5 metrics");
+console.log("[Evaluation System] API endpoints available at /api/evaluation");
 
 // Optionally auto-start the Discord bot
 if (DISCORD_AUTO_START) {
