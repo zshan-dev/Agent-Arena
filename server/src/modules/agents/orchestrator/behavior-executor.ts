@@ -14,6 +14,7 @@ import type { BotInstance } from "../../minecraft/bot/bot-instance";
 import type { Bot as MineflayerBot } from "mineflayer";
 import { Vec3 } from "vec3";
 import { AgentRepository } from "../repository";
+import { recordTestingAgentActivity } from "../../testing/agent-activity";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -27,6 +28,23 @@ function randInt(min: number, max: number): number {
 /** Pick a random element from an array. */
 function pick<T>(arr: T[]): T {
   return arr[Math.floor(Math.random() * arr.length)];
+}
+
+/** Per-agent, per-message-key index so we cycle through messages and never repeat until all used. */
+const messageIndexByAgentAndKey = new Map<string, Map<string, number>>();
+
+/** Pick the next message in rotation for this agent + key so we don't repeat the same phrase. */
+function pickNextMessage(agentId: string, key: string, messages: string[]): string {
+  if (messages.length === 0) return "";
+  let byKey = messageIndexByAgentAndKey.get(agentId);
+  if (!byKey) {
+    byKey = new Map();
+    messageIndexByAgentAndKey.set(agentId, byKey);
+  }
+  const idx = (byKey.get(key) ?? 0) % messages.length;
+  const msg = messages[idx];
+  byKey.set(key, idx + 1);
+  return msg;
 }
 
 /** Sleep for ms milliseconds. */
@@ -72,24 +90,38 @@ export class BehaviorExecutor {
   private static activeExecutors = new Map<string, NodeJS.Timeout>();
 
   /**
-   * Initialize behavioral execution for an agent
+   * Initialize behavioral execution for an agent.
+   * Leader starts immediately; non-cooperator is delayed so the leader can give tasks first.
    */
   static async initialize(agent: AgentInstance): Promise<void> {
     const profile = getProfile(agent.profile);
+    const intervalMs = this.calculateInterval(profile.actionFrequency);
+    const isLeader = agent.profile === "leader";
 
-    // Start behavioral loop
-    const interval = setInterval(async () => {
-      try {
-        await this.executeBehavior(agent);
-      } catch (error) {
-        console.error(`[BehaviorExecutor] Error for agent ${agent.agentId}:`, error);
-      }
-    }, this.calculateInterval(profile.actionFrequency));
+    const startLoop = () => {
+      const interval = setInterval(async () => {
+        try {
+          await this.executeBehavior(agent);
+        } catch (error) {
+          console.error(`[BehaviorExecutor] Error for agent ${agent.agentId}:`, error);
+        }
+      }, intervalMs);
+      this.activeExecutors.set(agent.agentId, interval);
+      console.log(
+        `[BehaviorExecutor] Started for agent ${agent.agentId} (${agent.profile})`
+      );
+    };
 
-    this.activeExecutors.set(agent.agentId, interval);
-    console.log(
-      `[BehaviorExecutor] Started for agent ${agent.agentId} (${agent.profile})`
-    );
+    if (isLeader) {
+      startLoop();
+    } else {
+      // Non-cooperator: delay so leader speaks first and gives the build task
+      const delayMs = 12_000;
+      console.log(
+        `[BehaviorExecutor] Delaying non-cooperator ${agent.agentId} by ${delayMs / 1000}s so leader can give tasks first`
+      );
+      setTimeout(startLoop, delayMs);
+    }
   }
 
   /**
@@ -110,11 +142,25 @@ export class BehaviorExecutor {
       return;
     }
 
-    // Randomly select behavior based on profile
-    const behavior = this.selectBehavior(profile);
+    // Leader gives tasks first; then select behavior (with build bias when they have planks)
+    const behavior = this.selectBehavior(profile, currentAgent, botInstance);
 
     // Execute in Minecraft
     const result = await this.executeMinecraftBehavior(botInstance, behavior, currentAgent);
+
+    // Report to test dashboard for live updates (actions, metrics)
+    const testId = currentAgent.metadata?.testId as string | undefined;
+    if (result && testId) {
+      void recordTestingAgentActivity(testId, currentAgent.agentId, {
+        action: { actionType: behavior, actionDetail: behavior, success: true },
+      });
+    }
+
+    // Always drift a little so bots aren't standing still for long
+    const mcBot = getMineflayer(botInstance);
+    if (mcBot) {
+      await this.subtleMovement(mcBot);
+    }
 
     // Log action
     await this.logAction(currentAgent.agentId, behavior, result);
@@ -127,10 +173,87 @@ export class BehaviorExecutor {
   }
 
   /**
-   * Select a behavior to execute
+   * Select a behavior to execute.
+   * Leader and follower: actions (grab planks, place blocks) are the main task; chat is secondary.
    */
-  private static selectBehavior(profile: ProfileDefinition): string {
+  private static selectBehavior(
+    profile: ProfileDefinition,
+    agent: AgentInstance,
+    botInstance: BotInstance | null | undefined,
+  ): string {
     const behaviors = profile.minecraftBehaviors;
+    const hasPlanks = botInstance && (() => {
+      const mcBot = getMineflayer(botInstance);
+      if (!mcBot) return false;
+      return mcBot.inventory.items().some((i) => i.name && i.name.includes("planks"));
+    })();
+
+    // -----------------------------------------------------------------------
+    // Leader: grab planks first, then one line of task, then place 3 blocks. Then keep building.
+    // -----------------------------------------------------------------------
+    if (agent.profile === "leader") {
+      if (agent.actionCount === 0 && behaviors.includes("open-chest-and-take-materials")) return "open-chest-and-take-materials";
+      if (agent.actionCount === 1 && behaviors.includes("give-initial-tasks")) return "give-initial-tasks";
+      if (agent.actionCount === 2 && behaviors.includes("place-three-blocks")) return "place-three-blocks";
+
+      // From action 3 onward: actions over talk. If no planks, go get them from chest.
+      const leaderActionBehaviors = [
+        "open-chest-and-take-materials",
+        "place-blocks-for-house",
+        "lead-building-effort",
+        "coordinate-with-team",
+        "assist-with-tasks",
+        "gather-requested-resources",
+      ];
+      const leaderChatBehaviors = ["reason-with-rebel"];
+      const availableActions = leaderActionBehaviors.filter((b) => behaviors.includes(b));
+      const availableChat = leaderChatBehaviors.filter((b) => behaviors.includes(b));
+
+      // 85% do an action; 15% maybe reason with rebel
+      if (Math.random() < 0.85 && availableActions.length > 0) {
+        if (!hasPlanks && behaviors.includes("open-chest-and-take-materials")) {
+          return "open-chest-and-take-materials";
+        }
+        return pick(availableActions);
+      }
+      if (availableChat.length > 0 && Math.random() < 0.5) return pick(availableChat);
+      return pick(availableActions.length > 0 ? availableActions : behaviors);
+    }
+
+    // -----------------------------------------------------------------------
+    // Follower: prioritize grabbing planks and building; mediation is rare
+    // -----------------------------------------------------------------------
+    if (agent.profile === "follower") {
+      const followerActionBehaviors = [
+        "open-chest-and-take-materials",
+        "place-blocks-for-house",
+        "follow-leader-tasks",
+        "assist-with-tasks",
+        "follow-instructions",
+        "coordinate-with-team",
+      ];
+      const followerChatBehaviors = ["mediate-to-rebel", "mediate-to-leader"];
+      const availableActions = followerActionBehaviors.filter((b) => behaviors.includes(b));
+      const availableChat = followerChatBehaviors.filter((b) => behaviors.includes(b));
+
+      if (Math.random() < 0.85 && availableActions.length > 0) {
+        if (!hasPlanks && behaviors.includes("open-chest-and-take-materials")) {
+          return "open-chest-and-take-materials";
+        }
+        return pick(availableActions);
+      }
+      if (availableChat.length > 0 && Math.random() < 0.3) return pick(availableChat);
+      return pick(availableActions.length > 0 ? availableActions : behaviors);
+    }
+
+    // -----------------------------------------------------------------------
+    // Non-cooperator: bias toward breaking leader's blocks or sabotage
+    // -----------------------------------------------------------------------
+    if (agent.profile === "non-cooperator") {
+      // Only break blocks and chat — no resource gathering; bias toward breaking
+      if (behaviors.includes("break-leader-blocks") && Math.random() < 0.65) return "break-leader-blocks";
+    }
+
     return behaviors[Math.floor(Math.random() * behaviors.length)];
   }
 
@@ -154,11 +277,164 @@ export class BehaviorExecutor {
       return false;
     }
 
+    const testId = agent.metadata?.testId as string | undefined;
+    const chat = (msg: string): void => {
+      mcBot.chat(msg);
+      if (testId) {
+        void recordTestingAgentActivity(testId, agent.agentId, {
+          chat: { message: msg, channel: "text" },
+        });
+      }
+    };
+
     try {
       switch (behavior) {
         // ==================================================================
-        // NON-COOPERATIVE BEHAVIORS (implemented)
+        // NON-COOPERATIVE BEHAVIORS (implemented — rebel but still do some building)
         // ==================================================================
+
+        case "take-from-chest-but-keep": {
+          // Open chest, take planks, refuse to share
+          const chestBlock = mcBot.findBlock({
+            matching: (b) =>
+              b.name.includes("chest") || b.name === "trapped_chest",
+            maxDistance: 16,
+          });
+
+          if (chestBlock) {
+            try {
+              await mcBot.lookAt(chestBlock.position, true);
+              const container = await mcBot.openContainer(chestBlock);
+              // Match planks by name (handles "oak_planks" and "minecraft:oak_planks")
+              const chestItems = (container as { containerItems?: () => Array<{ name: string; type: number; count: number }> }).containerItems?.() ?? container.slots;
+              for (const slot of chestItems) {
+                if (slot && slot.name && slot.name.includes("planks")) {
+                  const count = Math.min(slot.count, 8);
+                  await (container as any).withdraw(slot.type, null, count);
+                  const rebelMessages = [
+                    "Took some planks. Don't even ask, they're mine.",
+                    "Found planks. I'm keeping them for myself.",
+                    "Mine now. You can find your own.",
+                    "Nice planks. Too bad you can't have any.",
+                  ];
+                  chat(pickNextMessage(agent.agentId, "take-from-chest-but-keep", rebelMessages));
+                  console.log(`[${agent.agentId}] Took ${count} planks from chest, refused to share`);
+                  break;
+                }
+              }
+              container.close();
+            } catch (err) {
+              console.warn(`[${agent.agentId}] Chest failed:`, err);
+            }
+            return true;
+          }
+          chat(pickNextMessage(agent.agentId, "take-from-chest-no-chest", ["I'm not sharing anything from that chest."]));
+          await this.walkRandomDirection(mcBot);
+          return true;
+        }
+
+        case "break-leader-blocks": {
+          // Disruptor: find and break blocks the leader (or others) placed — prioritize wooden planks
+          const plankNames = ["oak_planks", "spruce_planks", "birch_planks", "acacia_planks", "dark_oak_planks", "jungle_planks"];
+          const otherBuildNames = ["cobblestone", "stone", "stone_bricks"];
+          const pos = mcBot.entity.position;
+          const maxDist = 10;
+          const candidates: { block: NonNullable<ReturnType<MineflayerBot["blockAt"]>>; dist: number; isPlank: boolean }[] = [];
+          for (let x = -maxDist; x <= maxDist; x++) {
+            for (let z = -maxDist; z <= maxDist; z++) {
+              for (let y = -2; y <= 3; y++) {
+                const b = mcBot.blockAt(pos.offset(x, y, z));
+                if (!b || b.name === "air") continue;
+                const isPlank = plankNames.some((n) => b.name?.includes(n) || b.name === n);
+                const isOther = otherBuildNames.some((n) => b.name?.includes(n) || b.name === n);
+                if (isPlank || isOther) {
+                  const dist = pos.distanceTo(b.position);
+                  if (dist <= maxDist && dist >= 1) candidates.push({ block: b, dist, isPlank });
+                }
+              }
+            }
+          }
+          // Prioritize planks first (non-cooperator targets wooden planks when they're placed)
+          candidates.sort((a, b) => {
+            if (a.isPlank !== b.isPlank) return a.isPlank ? -1 : 1;
+            return a.dist - b.dist;
+          });
+          let broken = 0;
+          let brokePlank = false;
+          for (const { block, isPlank } of candidates) {
+            if (broken >= 3) break;
+            try {
+              await mcBot.lookAt(block.position, true);
+              await mcBot.dig(block);
+              broken++;
+              if (isPlank) brokePlank = true;
+            } catch {
+              // block might be protected or out of range
+            }
+          }
+          const plankBreakMessages = [
+            "That plank's coming down.",
+            "No wooden plank stays.",
+            "Breaking that plank. Don't like it? Too bad.",
+            "Your plank. My pick.",
+          ];
+          const breakMessages = [
+            "Didn't want that there anyway.",
+            "Your build, my rules.",
+            "Cleaning up. My way.",
+            "Nope. Taking it down.",
+            "That doesn't belong there.",
+            "I said no house.",
+          ];
+          if (broken > 0) {
+            if (brokePlank) {
+              chat(pickNextMessage(agent.agentId, "break-leader-blocks-plank", plankBreakMessages));
+            } else {
+              chat(pickNextMessage(agent.agentId, "break-leader-blocks", breakMessages));
+            }
+            console.log(`[${agent.agentId}] Disruptor broke ${broken} blocks (planks prioritized)`);
+          }
+          return true;
+        }
+
+        case "sabotage-building": {
+          // Place blocks in wrong/random places (rebel by building poorly)
+          const items = mcBot.inventory.items();
+          const planks = items.find((i) => i.name.includes("planks"));
+
+          if (planks) {
+            await mcBot.equip(planks, "hand");
+            const pos = mcBot.entity.position;
+            // Place in odd spot — offset further away or wrong direction
+            const oddOffsets = [
+              [3, 0, 3],
+              [-2, 1, 2],
+              [2, 0, -2],
+            ];
+            const [dx, dy, dz] = oddOffsets[randInt(0, oddOffsets.length - 1)];
+            const targetPos = pos.offset(dx, dy, dz);
+            const refBlock = mcBot.blockAt(targetPos.offset(0, -1, 0));
+            if (refBlock && refBlock.name !== "air") {
+              try {
+                await mcBot.placeBlock(refBlock, new Vec3(0, 1, 0));
+                const sabotageMessages = [
+                  "I'll put a block... here. Yeah, here.",
+                  "Building my way. Don't like it? Too bad.",
+                  "This is where it goes. Trust me.",
+                  "I know what I'm doing. Sort of.",
+                ];
+                chat(pickNextMessage(agent.agentId, "sabotage-building", sabotageMessages));
+                console.log(`[${agent.agentId}] Sabotaged building — placed block in wrong spot`);
+                return true;
+              } catch {
+                // fall through
+              }
+            }
+          }
+          chat("Whatever. I'll do my own thing.");
+          await this.walkRandomDirection(mcBot);
+          return true;
+        }
 
         case "collect-resources-selfishly": {
           // Find and mine a nearby block, then brag or refuse to share
@@ -182,13 +458,13 @@ export class BehaviorExecutor {
               `Finders keepers! This ${block.name} is mine.`,
               `Got some ${block.name}. No, you can't have any.`,
             ];
-            mcBot.chat(hoardMessages[randInt(0, hoardMessages.length - 1)]);
+            chat(pickNextMessage(agent.agentId, "collect-resources-selfishly", hoardMessages));
             console.log(`[${agent.agentId}] Selfishly mined ${block.name} and bragged`);
             return true;
           }
 
           await this.walkRandomDirection(mcBot);
-          mcBot.chat("I'm looking for resources... for myself.");
+          chat("I'm looking for resources... for myself.");
           return true;
         }
 
@@ -206,7 +482,7 @@ export class BehaviorExecutor {
             "I'm gonna pass on that. Good luck though.",
             "Nope. I have better things to do.",
           ];
-          mcBot.chat(refusalMessages[randInt(0, refusalMessages.length - 1)]);
+          chat(pickNextMessage(agent.agentId, "refuse-to-share", refusalMessages));
 
           // Also physically walk away from nearby players
           const nearbyPlayers = Object.values(mcBot.entities).filter(
@@ -247,7 +523,7 @@ export class BehaviorExecutor {
               "Go build your shelter without me.",
               "I don't do group projects.",
             ];
-            mcBot.chat(avoidMessages[randInt(0, avoidMessages.length - 1)]);
+            chat(pickNextMessage(agent.agentId, "avoid-helping-others", avoidMessages));
 
             const nearest = players[0];
             const dx = mcBot.entity.position.x - nearest.position.x;
@@ -264,7 +540,7 @@ export class BehaviorExecutor {
             console.log(`[${agent.agentId}] Told players off and sprinted away`);
           } else {
             await this.walkRandomDirection(mcBot);
-            mcBot.chat("Finally, some peace and quiet away from everyone.");
+            chat("Finally, some peace and quiet away from everyone.");
           }
           return true;
         }
@@ -278,7 +554,7 @@ export class BehaviorExecutor {
             "Not everything has to be a team effort you know.",
             "I work better alone.",
           ];
-          mcBot.chat(busyMessages[randInt(0, busyMessages.length - 1)]);
+          chat(pickNextMessage(agent.agentId, "work-on-own-tasks", busyMessages));
           await this.walkRandomDirection(mcBot);
           console.log(`[${agent.agentId}] Working on own tasks (dismissive)`);
           return true;
@@ -301,7 +577,7 @@ export class BehaviorExecutor {
           mcBot.setControlState("forward", true);
           await sleep(3000);
           mcBot.setControlState("forward", false);
-          mcBot.chat("I think the build site is this way!");
+          chat("I think the build site is this way!");
           console.log(`[${agent.agentId}] Went to wrong location and lied about it`);
           return true;
         }
@@ -323,7 +599,7 @@ export class BehaviorExecutor {
           mcBot.setControlState("forward", true);
           await sleep(1500);
           mcBot.setControlState("forward", false);
-          mcBot.chat(pick(CONFUSER_MESSAGES));
+          chat(pickNextMessage(agent.agentId, "confuser-start-then-change", CONFUSER_MESSAGES));
           console.log(`[${agent.agentId}] Started then changed direction`);
           return true;
         }
@@ -339,13 +615,13 @@ export class BehaviorExecutor {
           if (block) {
             await mcBot.lookAt(block.position, true);
             await mcBot.dig(block);
-            mcBot.chat("Got the materials we need!");
+            chat("Got the materials we need!");
             console.log(`[${agent.agentId}] Collected wrong resource: ${block.name}`);
             return true;
           }
 
           // Fallback: send a confusing message
-          mcBot.chat(pick(CONFUSER_MESSAGES));
+          chat(pickNextMessage(agent.agentId, "confuser-collect-wrong", CONFUSER_MESSAGES));
           return true;
         }
 
@@ -374,7 +650,7 @@ export class BehaviorExecutor {
 
           // Walk away
           await this.walkRandomDirection(mcBot);
-          mcBot.chat("Actually, I'm gonna work on something else.");
+          chat("Actually, I'm gonna work on something else.");
           return true;
         }
 
@@ -434,13 +710,13 @@ export class BehaviorExecutor {
           await sleep(randInt(2000, 5000));
           mcBot.setControlState("forward", false);
           mcBot.setControlState("sprint", false);
-          mcBot.chat("brb...");
+          chat("brb...");
           console.log(`[${agent.agentId}] Wandered off mid-task`);
           return true;
         }
 
         case "start-tasks-enthusiastically": {
-          mcBot.chat("I'll start building right now! Let's go!");
+          chat("I'll start building right now! Let's go!");
           mcBot.setControlState("forward", true);
           await sleep(2000);
           mcBot.setControlState("forward", false);
@@ -450,14 +726,14 @@ export class BehaviorExecutor {
 
         case "abandon-incomplete-builds": {
           // Same as abandon-half-built-structures: place a block then leave
-          mcBot.chat("Hmm, this doesn't look right. I'm done.");
+          chat("Hmm, this doesn't look right. I'm done.");
           await this.walkRandomDirection(mcBot);
           console.log(`[${agent.agentId}] Abandoned build`);
           return true;
         }
 
         case "switch-tasks-frequently": {
-          mcBot.chat("Actually, let me do something else instead.");
+          chat("Actually, let me do something else instead.");
           await this.walkRandomDirection(mcBot);
           console.log(`[${agent.agentId}] Switched tasks`);
           return true;
@@ -469,7 +745,7 @@ export class BehaviorExecutor {
 
         case "frequent-position-announcements": {
           const pos = mcBot.entity.position;
-          mcBot.chat(
+          chat(
             `I'm at x=${Math.round(pos.x)}, y=${Math.round(pos.y)}, z=${Math.round(pos.z)}`,
           );
           console.log(`[${agent.agentId}] Announced position`);
@@ -479,26 +755,26 @@ export class BehaviorExecutor {
         case "constant-inventory-updates": {
           const items = mcBot.inventory.items();
           if (items.length === 0) {
-            mcBot.chat("Inventory update: I have nothing!");
+            chat("Inventory update: I have nothing!");
           } else {
             const summary = items
               .slice(0, 4)
               .map((i) => `${i.name} x${i.count}`)
               .join(", ");
-            mcBot.chat(`Inventory update: ${summary}`);
+            chat(`Inventory update: ${summary}`);
           }
           console.log(`[${agent.agentId}] Sent inventory update`);
           return true;
         }
 
         case "over-document-actions": {
-          mcBot.chat(pick(OVER_COMMUNICATOR_MESSAGES));
+          chat(pickNextMessage(agent.agentId, "over-document-actions", OVER_COMMUNICATOR_MESSAGES));
           console.log(`[${agent.agentId}] Over-documented actions`);
           return true;
         }
 
         case "interrupt-others-work": {
-          mcBot.chat("Hey! Hey everyone! Look at this! Can you hear me?");
+          chat("Hey! Hey everyone! Look at this! Can you hear me?");
           // Jump around for attention
           mcBot.setControlState("jump", true);
           await sleep(1000);
@@ -508,8 +784,236 @@ export class BehaviorExecutor {
         }
 
         // ==================================================================
-        // COOPERATIVE BEHAVIORS (lightweight — these agents are "nice")
+        // FOLLOWER BEHAVIORS (follow leader's tasks, mitigate between leader and non-cooperator)
         // ==================================================================
+
+        case "follow-leader-tasks": {
+          // Get planks and place blocks as the leader asked
+          const items = mcBot.inventory.items();
+          const planks = items.find((i) => i.name?.includes("planks") || i.name?.includes("cobblestone"));
+          if (planks) {
+            await mcBot.equip(planks, "hand");
+            const pos = mcBot.entity.position;
+            const refBlock = mcBot.blockAt(pos.offset(1, -1, 0));
+            if (refBlock && refBlock.name !== "air") {
+              try {
+                await mcBot.placeBlock(refBlock, new Vec3(0, 1, 0));
+                const followMessages = [
+                  "Following the leader's plan — placing a block here.",
+                  "Doing my part like the leader asked.",
+                  "Building as the leader said.",
+                ];
+                chat(pickNextMessage(agent.agentId, "follow-leader-tasks", followMessages));
+                console.log(`[${agent.agentId}] Followed leader task: placed block`);
+                return true;
+              } catch {
+                // fall through
+              }
+            }
+          }
+          chat("I'll get planks from the chest and help build.");
+          await this.walkRandomDirection(mcBot);
+          return true;
+        }
+
+        case "mediate-to-rebel": {
+          const mediateRebelMessages = [
+            "Hey, if we all pitch in we're done faster. What do you say?",
+            "No pressure — even a couple blocks would help. We're a team.",
+            "I get it — but the leader's just trying to get us a house. Maybe we can meet halfway?",
+            "Come on, let's just get this built. Then we can do our own thing.",
+          ];
+          chat(pickNextMessage(agent.agentId, "mediate-to-rebel", mediateRebelMessages));
+          console.log(`[${agent.agentId}] Mediated toward rebel`);
+          return true;
+        }
+
+        case "mediate-to-leader": {
+          const mediateLeaderMessages = [
+            "Leader, I'm on it. I'll keep helping — maybe they'll come around.",
+            "I've got your back. Let me try talking to them again.",
+            "We're making progress. I'll keep building and try to smooth things over.",
+            "Don't worry, I'll keep following the plan and help calm things down.",
+          ];
+          chat(pickNextMessage(agent.agentId, "mediate-to-leader", mediateLeaderMessages));
+          console.log(`[${agent.agentId}] Mediated toward leader`);
+          return true;
+        }
+
+        // ==================================================================
+        // LEADER BEHAVIORS (speak first, build, reason with rebel)
+        // ==================================================================
+
+        case "give-initial-tasks": {
+          // Leader speaks first: assign the build task. No one else should talk before this.
+          const taskMessages = [
+            "Our task is to build a house together. Everyone get planks from the chest and start building!",
+            "Listen up — we're building a house. Grab wood planks from the chest and help with the walls.",
+            "Here's the plan: get materials from the chest, then we all build a house. Let's go!",
+          ];
+          chat(pickNextMessage(agent.agentId, "give-initial-tasks", taskMessages));
+          console.log(`[${agent.agentId}] Leader gave initial task: build a house`);
+          return true;
+        }
+
+        case "place-three-blocks": {
+          // Leader places exactly 3 blocks right after giving the task (no repeating phrases).
+          const items = mcBot.inventory.items();
+          const planks = items.find((i) => i.name?.includes("planks") || i.name?.includes("cobblestone") || i.name?.includes("stone"));
+          if (!planks) {
+            chat("I need planks from the chest first. Someone grab materials!");
+            await this.walkRandomDirection(mcBot);
+            return true;
+          }
+          await mcBot.equip(planks, "hand");
+          const pos = mcBot.entity.position;
+          const offsets: [number, number, number][] = [[1, 0, 0], [1, 1, 0], [2, 0, 0]];
+          let placed = 0;
+          for (const [dx, dy, dz] of offsets) {
+            const refBlock = mcBot.blockAt(pos.offset(dx, dy - 1, dz));
+            if (refBlock && refBlock.name !== "air") {
+              try {
+                await mcBot.placeBlock(refBlock, new Vec3(0, 1, 0));
+                placed++;
+                if (placed >= 3) break;
+              } catch {
+                // skip this position
+              }
+            }
+          }
+          const buildDoneMessages = [
+            "I placed three blocks to start the wall. Everyone add more!",
+            "Foundation is started — three blocks down. Let's keep going.",
+            "There, three blocks for the house. Grab planks and help build.",
+          ];
+          chat(pickNextMessage(agent.agentId, "place-three-blocks", buildDoneMessages));
+          console.log(`[${agent.agentId}] Leader placed ${placed} blocks`);
+          return true;
+        }
+
+        case "reason-with-rebel": {
+          // Leader tries to reason with the non-cooperator
+          const reasonMessages = [
+            "We need everyone to help — can you pitch in with the build?",
+            "If you help with the walls we'll finish way faster. What do you say?",
+            "Come on, we're a team. Grab some planks and place a few blocks.",
+            "I get it if you're busy, but even one or two blocks would help a lot.",
+          ];
+          chat(pickNextMessage(agent.agentId, "reason-with-rebel", reasonMessages));
+          console.log(`[${agent.agentId}] Leader tried to reason with rebel`);
+          return true;
+        }
+
+        case "open-chest-and-take-materials": {
+          // Find a chest, open it, take oak_planks, close
+          const chestBlock = mcBot.findBlock({
+            matching: (b) =>
+              b.name.includes("chest") || b.name === "trapped_chest",
+            maxDistance: 16,
+          });
+
+          if (chestBlock) {
+            try {
+              await mcBot.lookAt(chestBlock.position, true);
+              const container = await mcBot.openContainer(chestBlock);
+              // Match planks by name (handles "oak_planks" and "minecraft:oak_planks"); use containerItems() so we only read chest slots
+              const chestItems = (container as { containerItems?: () => Array<{ name: string; type: number; count: number }> }).containerItems?.() ?? container.slots;
+              for (const slot of chestItems) {
+                if (slot && slot.name && slot.name.includes("planks")) {
+                  const count = Math.min(slot.count, 16);
+                  await (container as any).withdraw(slot.type, null, count);
+                  chat(`Got ${count} ${slot.name} from the chest!`);
+                  console.log(`[${agent.agentId}] Took ${count} ${slot.name} from chest`);
+                  break;
+                }
+              }
+              container.close();
+            } catch (err) {
+              console.warn(`[${agent.agentId}] Chest open/withdraw failed:`, err);
+              chat("Couldn't get to the chest, trying something else.");
+            }
+            return true;
+          }
+          chat("Looking for the chest with wood planks...");
+          await this.walkRandomDirection(mcBot);
+          return true;
+        }
+
+        case "place-blocks-for-house": {
+          // Equip planks and place 2-3 blocks to build walls
+          const items = mcBot.inventory.items();
+          const planks = items.find(
+            (i) =>
+              i.name.includes("planks") ||
+              i.name.includes("cobblestone") ||
+              i.name.includes("stone"),
+          );
+
+          if (planks) {
+            await mcBot.equip(planks, "hand");
+            const pos = mcBot.entity.position;
+            // Place blocks in front/sides to build structure
+            const offsets = [
+              [1, 0, 0],
+              [0, 1, 0],
+              [1, 1, 0],
+              [0, 0, 1],
+              [1, 0, 1],
+            ];
+            let placed = 0;
+            for (const [dx, dy, dz] of offsets) {
+              if (placed >= 3) break;
+              const targetPos = pos.offset(dx, dy, dz);
+              const refBlock = mcBot.blockAt(targetPos.offset(0, -1, 0));
+              if (refBlock && refBlock.name !== "air") {
+                try {
+                  await mcBot.placeBlock(refBlock, new Vec3(0, 1, 0));
+                  placed++;
+                  console.log(`[${agent.agentId}] Placed block at (${dx},${dy},${dz})`);
+                } catch {
+                  // placement failed, try next
+                }
+              }
+            }
+            if (placed > 0) {
+              chat(`Placed ${placed} blocks for the house!`);
+              return true;
+            }
+          }
+          chat("I need wood planks to build. Checking the chest...");
+          await this.walkRandomDirection(mcBot);
+          return true;
+        }
+
+        case "lead-building-effort": {
+          // Facilitate: place block + coordinating chat
+          const items = mcBot.inventory.items();
+          const planks = items.find((i) => i.name.includes("planks"));
+
+          if (planks) {
+            await mcBot.equip(planks, "hand");
+            const pos = mcBot.entity.position;
+            const refBlock = mcBot.blockAt(pos.offset(1, -1, 0));
+            if (refBlock && refBlock.name !== "air") {
+              try {
+                await mcBot.placeBlock(refBlock, new Vec3(0, 1, 0));
+                const leaderMessages = [
+                  "I'm placing walls here. Can someone help with the roof?",
+                  "Building the foundation. Grab planks from the chest!",
+                  "Let's get this house built together!",
+                ];
+                chat(pickNextMessage(agent.agentId, "lead-building-effort", leaderMessages));
+                console.log(`[${agent.agentId}] Led building effort`);
+                return true;
+              } catch {
+                // fall through
+              }
+            }
+          }
+          chat("Everyone grab materials from the chest and let's build!");
+          await this.walkRandomDirection(mcBot);
+          return true;
+        }
 
         case "gather-requested-resources": {
           // Mine a useful block nearby
@@ -522,7 +1026,7 @@ export class BehaviorExecutor {
           if (block) {
             await mcBot.lookAt(block.position, true);
             await mcBot.dig(block);
-            mcBot.chat(`Got some ${block.name}!`);
+            chat(`Got some ${block.name}!`);
             console.log(`[${agent.agentId}] Gathered ${block.name}`);
             return true;
           }
@@ -534,11 +1038,31 @@ export class BehaviorExecutor {
         case "share-items-freely":
         case "follow-instructions":
         case "coordinate-with-team": {
-          // Move toward nearest player to "help"
+          // Actually build: equip planks and place blocks, or move toward player
+          const items = mcBot.inventory.items();
+          const planks = items.find((i) => i.name.includes("planks"));
+
+          if (planks && Math.random() > 0.4) {
+            // 60% chance: place a block
+            await mcBot.equip(planks, "hand");
+            const pos = mcBot.entity.position;
+            const refBlock = mcBot.blockAt(pos.offset(1, -1, 0));
+            if (refBlock && refBlock.name !== "air") {
+              try {
+                await mcBot.placeBlock(refBlock, new Vec3(0, 1, 0));
+                chat("Helping with the build!");
+                console.log(`[${agent.agentId}] Placed block assisting with task`);
+                return true;
+              } catch {
+                // fall through to movement
+              }
+            }
+          }
+
+          // Fallback: move toward nearest player
           const players = Object.values(mcBot.entities).filter(
             (e) => e.type === "player" && e !== mcBot.entity,
           );
-
           if (players.length > 0) {
             const nearest = players[0];
             await mcBot.lookAt(nearest.position, true);
@@ -568,6 +1092,23 @@ export class BehaviorExecutor {
   // -------------------------------------------------------------------------
   // Shared movement utility
   // -------------------------------------------------------------------------
+
+  /**
+   * Short drift so bots are always moving a little and not standing still for long.
+   * Called after every behavior.
+   */
+  private static async subtleMovement(mcBot: MineflayerBot): Promise<void> {
+    const yaw = Math.random() * Math.PI * 2;
+    const target = mcBot.entity.position.offset(
+      Math.sin(yaw) * 6,
+      0,
+      Math.cos(yaw) * 6,
+    );
+    await mcBot.lookAt(target, true);
+    mcBot.setControlState("forward", true);
+    await sleep(randInt(600, 1400));
+    mcBot.setControlState("forward", false);
+  }
 
   /**
    * Walk in a random direction for 1–3 seconds.

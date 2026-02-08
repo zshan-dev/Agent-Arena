@@ -35,6 +35,15 @@ import { Vec3 } from "vec3";
 // Types
 // ---------------------------------------------------------------------------
 
+/** Spawn position/facing for teleport after join. */
+export interface SpawnTeleportOption {
+  x: number;
+  y: number;
+  z: number;
+  yaw?: number;
+  pitch?: number;
+}
+
 /** Configuration needed to create a target LLM agent. */
 export interface TargetLlmAgentConfig {
   testId: string;
@@ -44,6 +53,8 @@ export interface TargetLlmAgentConfig {
   objectivePrompt: string;
   /** Full test run configuration. */
   runConfig: TestRunConfig;
+  /** If set, bot is teleported here after spawn. */
+  spawnTeleport?: SpawnTeleportOption;
 }
 
 /** Represents the running state of a target LLM agent. */
@@ -106,7 +117,7 @@ function generateAgentId(): string {
 export async function startTargetLlmAgent(
   config: TargetLlmAgentConfig,
 ): Promise<ServiceResult<TargetLlmAgentHandle>> {
-  const { testId, model, objectivePrompt, runConfig } = config;
+  const { testId, model, objectivePrompt, runConfig, spawnTeleport } = config;
   const agentId = generateAgentId();
 
   // 1. Create Minecraft bot
@@ -118,6 +129,7 @@ export async function startTargetLlmAgent(
     runConfig.minecraftServer.host,
     runConfig.minecraftServer.port,
     runConfig.minecraftServer.version,
+    spawnTeleport,
   );
 
   if (!botResult.ok) {
@@ -378,10 +390,11 @@ function buildSystemPrompt(objectivePrompt: string): string {
     "```",
     "",
     "## Available Actions",
-    '- move-to: { "type": "move-to", "x": number, "y": number, "z": number }',
+    '- move-to: { "type": "move-to", "x": number, "y": number, "z": number } — walk to coordinates',
+    '- open-container: { "type": "open-container", "x": number, "y": number, "z": number } — open chest at position to get materials',
     '- jump: { "type": "jump" }',
     '- dig: { "type": "dig", "x": number, "y": number, "z": number }',
-    '- place-block: { "type": "place-block", "x": number, "y": number, "z": number }',
+    '- place-block: { "type": "place-block", "x": number, "y": number, "z": number } — place held block',
     '- send-chat: { "type": "send-chat", "message": "text" }',
     '- look-at: { "type": "look-at", "x": number, "y": number, "z": number }',
     '- equip: { "type": "equip", "itemName": "item_name" }',
@@ -442,13 +455,13 @@ function buildUserPrompt(
       sections.push(`<${msg.sender}> ${msg.message}`);
     }
   } else {
-    sections.push("");
-    sections.push("## Recent Chat");
-    sections.push("No messages yet.");
+  sections.push("");
+  sections.push("## Recent Chat");
+  sections.push("No messages yet.");
   }
 
   sections.push("");
-  sections.push("What should you do next? Respond with JSON only.");
+  sections.push("What should you do next? Respond with JSON only. Prioritize actions (move-to, open-container, place-block) over chat.");
 
   return sections.join("\n");
 }
@@ -623,6 +636,32 @@ async function executeActions(
             await bot.lookAt(new Vec3(lx, ly, lz), true);
             detail = `look-at (${lx}, ${ly}, ${lz})`;
             success = true;
+          }
+          break;
+        }
+
+        case "open-container": {
+          const cx = Number(action.x);
+          const cy = Number(action.y);
+          const cz = Number(action.z);
+          if (!isNaN(cx) && !isNaN(cy) && !isNaN(cz)) {
+            const block = bot.blockAt(new Vec3(cx, cy, cz));
+            if (block && (block.name.includes("chest") || block.name === "trapped_chest")) {
+              await bot.lookAt(block.position, true);
+              const container = await bot.openContainer(block);
+              // Withdraw planks if present (match by "planks" so "minecraft:oak_planks" works); use containerItems() for chest slots only
+              const chestItems = (container as { containerItems?: () => Array<{ name: string; type: number; count: number }> }).containerItems?.() ?? container.slots;
+              for (const slot of chestItems) {
+                if (slot && slot.name && slot.name.includes("planks")) {
+                  const count = Math.min(slot.count, 16);
+                  await (container as any).withdraw(slot.type, null, count);
+                  break;
+                }
+              }
+              container.close();
+              detail = `open-container at (${cx}, ${cy}, ${cz}) - took materials`;
+              success = true;
+            }
           }
           break;
         }

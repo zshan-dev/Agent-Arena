@@ -155,7 +155,10 @@ export class TestRunner {
       testId,
       scenarioType: request.scenarioType,
       status: "created",
-      targetLlmModel: request.targetLlmModel ?? DEFAULT_LLM_MODEL,
+      targetLlmModel:
+        (typeof request.targetLlmModel === "string" && request.targetLlmModel.trim())
+          ? request.targetLlmModel.trim()
+          : DEFAULT_LLM_MODEL,
       testingAgentProfiles: profiles,
       testingAgentIds: [],
       targetAgentId: null,
@@ -348,30 +351,23 @@ export class TestRunner {
     }
 
     // -----------------------------------------------------------------------
-    // Step 3: Agent Spawning
+    // Step 3: Agent Spawning (testing agents only — no target LLM bot)
     // -----------------------------------------------------------------------
 
-    // 3a. Spawn the target LLM agent
-    const targetResult = await startTargetLlmAgent({
-      testId,
-      model: testRun.targetLlmModel,
-      objectivePrompt: scenario.objectivePrompt,
-      runConfig: testRun.config,
-    });
+    const spawnTeleport = scenario.initialConditions.spawnPosition
+      ? {
+          x: scenario.initialConditions.spawnPosition.x,
+          y: scenario.initialConditions.spawnPosition.y,
+          z: scenario.initialConditions.spawnPosition.z,
+          yaw: scenario.initialConditions.spawnPosition.yaw,
+          pitch: scenario.initialConditions.spawnPosition.pitch,
+        }
+      : undefined;
 
-    if (!targetResult.ok) {
-      throw new Error(`Target agent failed: ${targetResult.message}`);
-    }
+    // Target LLM agent is not spawned — only leader, follower, non-cooperator, etc. run in-game.
+    // (Removes the extra "llm_..." bot that did nothing.)
 
-    const targetHandle = targetResult.data;
-    activeHandles.set(testId, targetHandle);
-
-    await testingRepository.update(testId, {
-      targetAgentId: targetHandle.agentId,
-      targetBotId: targetHandle.botId,
-    });
-
-    // 3b. Spawn testing agents
+    // Spawn testing agents (leader, non-cooperator, follower, etc.)
     const spawnedAgentIds: string[] = [];
 
     for (let i = 0; i < testRun.testingAgentProfiles.length; i++) {
@@ -380,12 +376,14 @@ export class TestRunner {
 
       const agentResult = await AgentService.createAgent({
         profile,
+        testRunId: testId,
         minecraftServer: {
           host: testRun.config.minecraftServer.host,
           port: testRun.config.minecraftServer.port,
           version: testRun.config.minecraftServer.version,
         },
         behaviorIntensity: testRun.config.behaviorIntensity,
+        spawnTeleport,
       });
 
       if (agentResult.ok && agentResult.data) {
