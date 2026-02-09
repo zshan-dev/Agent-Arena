@@ -4,6 +4,10 @@
 
 Inspired by NVIDIA Omniverse's robotics training simulations, this framework evaluates LLMs through controlled behavioral challenges in Minecraft—testing cooperation, resource management, and decision-making under realistic adversarial conditions.
 
+**📹 [Watch the demo](https://youtu.be/-3Rs3XYj0t8)**
+
+[![Demo video](https://img.youtube.com/vi/-3Rs3XYj0t8/maxresdefault.jpg)](https://www.youtube.com/watch?v=-3Rs3XYj0t8)
+
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.8-blue)](https://www.typescriptlang.org/)
 [![Bun](https://img.shields.io/badge/Bun-1.x-black)](https://bun.sh)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
