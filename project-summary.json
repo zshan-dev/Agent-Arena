@@ -1,0 +1,42 @@
+{
+  "name": "Minecraft LLM Testing Toolkit",
+  "tagline": "Adversarial multi-agent testing for Large Language Models in observable 3D environments.",
+  "oneLiner": "See how your AI breaks—before your customers do.",
+  "idea": "Companies deploy LLMs to production with little more than static benchmarks and hope. We treat LLM evaluation like robotics validation: run agents in a simulated, observable world under stress (uncooperative peers, confusion, resource scarcity) and measure real behaviour—actions, messages, errors, recovery—so teams can decide readiness before rollout.",
+  "inspiration": "NVIDIA Omniverse: before deploying a robot to a warehouse, NVIDIA trains it in photorealistic simulation and stress-tests every failure mode. We apply the same principle to LLMs. We are not building a game mod; we are building an agentic auditing platform. Minecraft is the synthetic simulation environment—physics, coordination, and adversarial agents—where we conduct embodied stress testing.",
+  "problem": {
+    "currentState": "LLM evaluation is broken. Benchmarks test happy paths, single-agent tasks, and text-only outputs. In production, AI faces uncooperative users, conflicting information, resource constraints, and chaos. There is no equivalent of a crash test or stress test for autonomous agents.",
+    "gaps": [
+      "Black-box testing with limited observability",
+      "Single-agent benchmarks that miss coordination failures",
+      "Happy-path scenarios that do not reveal failure modes",
+      "No real-time insight into decision-making and recovery"
+    ]
+  },
+  "solution": {
+    "approach": "Place a target LLM in a Minecraft world with adversarial testing agents (e.g. non-cooperator, confuser). The LLM receives game state and chat on a fixed polling interval and outputs concrete actions (move, dig, place, chat). All decisions, actions, and messages are logged. We measure stability, engagement, error rate, and coordination—then surface a clear verdict and evaluation report tailored to the scenario.",
+    "whatWeBuilt": [
+      "End-to-end test pipeline: create test → run in Minecraft + Discord → live dashboard → results with verdict",
+      "Multiple behavioural profiles (Leader, Non-Cooperator, Confuser, Resource-Hoarder, etc.) and scenarios (cooperation, resource-management)",
+      "Real-time dashboard: test status, live metrics (response time, actions, messages, errors), agent grid, chat feed, action timeline",
+      "Results page with performance summary (objective, protocol, collected data, derived metrics, verdict, why it matters)",
+      "Evaluation report framed for enterprise/research: only the 1–2 dimensions each scenario targets (e.g. Resilience + HAI for cooperation), with proxy metrics from the run and clear 'not measured' where another scenario is required",
+      "Warehouse schema for analytics: test_runs and action_logs DDL plus a command to emit it for loading into a cloud data warehouse (e.g. Snowflake) for historical analysis",
+      "OpenRouter integration for 400+ LLM models; optional Discord voice (ElevenLabs TTS)"
+    ]
+  },
+  "aims": {
+    "solved": [
+      "Observable, multi-agent stress testing for LLMs in a 3D environment",
+      "Clear verdict (performed well / adequately / needs improvement / did not perform) from run data",
+      "Scenario-specific evaluation dimensions so reports are relevant, not generic checklists",
+      "Path to analytics at scale via warehouse schema and export"
+    ],
+    "positioning": "We provide the Carfax report for AI employees before you hire them. Companies can assess operational resilience, coordination, and cost-efficiency of an agent by simulating hours of labour in a physics-based environment—instead of relying only on static text benchmarks like MMLA."
+  },
+  "execution": {
+    "stack": "TypeScript, Bun, Elysia (backend), React + Vite + shadcn/ui (frontend), Mineflayer (Minecraft bots), Discord.js, OpenRouter (LLMs), Prisma/PostgreSQL.",
+    "modules": ["Testing (orchestration, scenarios, lifecycle)", "Agents (behavioural profiles, autonomous loops)", "Minecraft (bot management, 20+ actions)", "Discord (voice/text, TTS)", "LLM (OpenRouter via Vercel AI SDK)", "Evaluation (metrics, analysis)", "Warehouse (analytics schema and commands)"],
+    "demo": "Cooperation scenario with confuser and non-cooperator: one target LLM must pursue a shared goal while other agents refuse to help or spread confusion. The dashboard and results page show exactly how the agent held up."
+  }
+}
